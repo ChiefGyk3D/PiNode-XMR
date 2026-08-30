@@ -23,6 +23,20 @@ VARS=/home/pinodexmr/variables
 EXEC=/home/pinodexmr/execScripts
 BASE="${BASE:-http://127.0.0.1}"
 
+# The console requires authentication by default. Supply credentials with
+# PINODE_USER / PINODE_PASS, or let the script read the generated pair that
+# enable-web-auth.sh leaves in /root/pinode-web-credentials.
+CREDS_FILE=/root/pinode-web-credentials
+PINODE_USER="${PINODE_USER:-}"
+PINODE_PASS="${PINODE_PASS:-}"
+if [ -z "$PINODE_PASS" ] && [ -r "$CREDS_FILE" ]; then
+  PINODE_USER="${PINODE_USER:-$(awk '/^username:/{print $2}' "$CREDS_FILE")}"
+  PINODE_PASS="$(awk '/^password:/{print $2}' "$CREDS_FILE")"
+fi
+AUTH=()
+[ -n "$PINODE_PASS" ] && AUTH=(-u "${PINODE_USER:-pinodexmr}:$PINODE_PASS")
+CURL=(curl -fsS "${AUTH[@]+"${AUTH[@]}"}")
+
 PASS=0; FAIL=0; SKIP=0
 ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
@@ -55,8 +69,16 @@ bash "$REPO/home/pinodexmr/harden-permissions.sh" > /tmp/vm_harden.log 2>&1 \
   && ok "harden-permissions.sh completed" || bad "harden-permissions.sh failed (see /tmp/vm_harden.log)"
 systemctl restart apache2 2>/dev/null || service apache2 restart 2>/dev/null || apache2ctl -k restart 2>/dev/null
 sleep 2
-curl -fsS -o /dev/null "$BASE/runScript.php?function=x" 2>/dev/null \
-  && ok "console still serving after apache restart" || bad "console unreachable after apache restart"
+RC=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]+"${AUTH[@]}"}" -H 'X-PiNode-CSRF: 1' \
+  -X POST "$BASE/runScript.php" --data-urlencode 'function=x' 2>/dev/null)
+# 400 is the expected answer for an unknown selector; 401 means our credentials
+# were refused, and 000 means nothing is listening.
+case "$RC" in
+  400|200) ok "console still serving after apache restart (HTTP $RC)" ;;
+  401)     bad "console refused our credentials after restart - check $CREDS_FILE" ;;
+  000)     bad "console unreachable after apache restart" ;;
+  *)       bad "console answered HTTP $RC after apache restart" ;;
+esac
 
 sec "Web account's effective identity under Apache"
 cat > "$WEB_ROOT/_vmcheck.php" <<'PHP'
@@ -68,7 +90,8 @@ echo json_encode(['user' => $u['name'], 'groups' => $g,
   'can_write_private' => is_writable('/home/pinodexmr/execScripts/moneroPrivate.sh'),
   'can_write_vars' => is_writable('/home/pinodexmr/variables')]);
 PHP
-J=$(curl -fsS "$BASE/_vmcheck.php" 2>/dev/null); rm -f "$WEB_ROOT/_vmcheck.php"
+chmod 644 "$WEB_ROOT/_vmcheck.php" 2>/dev/null
+J=$("${CURL[@]}" "$BASE/_vmcheck.php" 2>/dev/null); rm -f "$WEB_ROOT/_vmcheck.php"
 echo "  $J"
 echo "$J" | grep -q '"groups":\[[^]]*pinodeweb' && ok "web account is in the pinodeweb group" \
   || bad "web account did NOT pick up pinodeweb - apache restart may not have taken effect"
@@ -101,6 +124,21 @@ if [ -d /run/systemd/system ]; then
   echo "    systemctl status moneroPrivate p2pool moneroCustomNode"
 else
   skip "systemd not running - cannot verify units here"
+fi
+
+sec "Authentication boundary"
+if [ -n "$PINODE_PASS" ]; then
+  for u in nodeControl.html mining-address.php runScript.php; do
+    c=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/$u")
+    { [ "$c" = "401" ] || [ "$c" = "403" ]; } && ok "$u refused without credentials (HTTP $c)" \
+      || bad "$u served unauthenticated (HTTP $c)"
+  done
+  c=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/nodeControl.html")
+  [ "$c" = "200" ] && ok "console reachable with credentials" || bad "console refused credentials (HTTP $c)"
+  H=/etc/apache2/.htpasswd
+  [ -f "$H" ] && { M=$(stat -c '%a' "$H"); [ "$M" = "640" ] && ok "htpasswd is 0640" || bad "htpasswd is $M, expected 640"; }
+else
+  skip "authentication not enabled - run home/pinodexmr/enable-web-auth.sh"
 fi
 
 sec "Apache config permissions"
