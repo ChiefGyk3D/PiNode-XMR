@@ -6,7 +6,17 @@ to help the upstream project identify and remediate the issues.
 
 > Scope of this review: the PHP endpoints under `HTML/`, the Apache
 > configuration, the `sudoers` policy, and the shell scripts that consume
-> web-set values. It is a source review only — no live instance was tested.
+> web-set values.
+>
+> Findings were reproduced and re-tested on a **reconstructed** deployment — the
+> real endpoint files served over HTTP, writing to their actual
+> `/home/pinodexmr` and `/var/www/html` paths, with the real start-up scripts
+> consuming the results as genuine `pinodexmr` and `www-data` accounts. That is
+> not the same as a full appliance: PHP was served by its built-in server rather
+> than Apache with mod_php, systemd units were emulated by invoking their
+> `ExecStart` command directly, and `monerod`/`p2pool` were replaced by stubs
+> that record their argv. See **Verification** below for what this does and does
+> not establish.
 
 ## Threat model
 
@@ -258,6 +268,29 @@ fixed in the branches above:
 2. `execScripts/` only needs to expose `moneroCustomNode.sh` to the web
    account, not the whole directory, so the hardening script grants the single
    file and relies on the in-place write fallback.
+
+### Not yet covered
+
+The reconstruction above exercises the code paths, but the following have **not**
+been validated on a real appliance and should be before these changes are relied
+on in production:
+
+- **Apache with mod_php**, rather than PHP's built-in development server. In
+  particular `www-data`'s effective group membership under Apache, which
+  `harden-permissions.sh` depends on (Apache must be restarted after the script
+  runs for the new group to take effect).
+- **Real systemd units** starting and restarting the node, rather than the
+  `ExecStart` command being invoked directly.
+- **Real `monerod` and `p2pool` binaries** accepting the generated command
+  lines. Argv construction was verified with recording stubs; the daemons
+  themselves were never launched.
+- **A full install/update run** of `ubuntu-install-continue.sh` and
+  `update-pinodexmr.sh` with the permission changes in place.
+- **`harden-permissions.sh` against an established install** carrying real
+  blockchain data, wallets and an existing `.htpasswd`.
+- **The PHP version actually shipped** by the target release. The syntax used is
+  PHP 7.0+ compatible and was executed on 8.4; the installer pulls the distro
+  `php` metapackage, so 7.4 through 8.3 are all plausible in the field.
 
 ## Reporting
 
