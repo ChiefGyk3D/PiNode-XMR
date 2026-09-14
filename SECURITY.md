@@ -244,6 +244,43 @@ the home directory and records installer and updater activity, was served.
 directly). `/debug.log` now returns 401 unauthenticated and 200 for the
 operator.
 
+### 10. Unrestricted monerod RPC exposed on all interfaces in Public Free mode — High (fixed)
+
+`home/pinodexmr/execScripts/moneroPublicFree.sh` started monerod with
+
+```
+--rpc-bind-ip=0.0.0.0 --rpc-bind-port=$MONERO_PUBLIC_PORT
+--rpc-restricted-bind-ip=$DEVICE_IP --rpc-restricted-bind-port=$MONERO_PORT
+```
+
+and no `--rpc-login`. The restricted endpoint on 18081 is the one wallets are
+meant to use. The **unrestricted** endpoint on 18089, which the status scripts
+and P2Pool use internally, was bound to every interface with no authentication.
+The comments in the mode-7 branches of `moneroStatus.sh`, `printPl.sh`,
+`BanListCompare.sh` and `p2pool.sh` ("No auth needed for local", "internal
+non-restricted port") show it was meant to be local only.
+
+Confirmed on a live monerod v0.18.5.1 started with those exact flags: from
+another host on the network, `get_bans` (an unrestricted-only method) on port
+18089 returned `status: OK` with no credentials, while the same call on 18081
+was refused with "Method not found". Anything that can reach 18089 can call
+`stop_daemon`, `set_bans`, `flush_txpool`, `set_limit` and the rest of the
+unrestricted API. If the operator forwarded 18089 as well, that is the
+internet.
+
+**Remediation (this fork):** the unrestricted endpoint is now bound to
+`127.0.0.1` and started with `--rpc-login=$RPCu:$RPCp`, the same login every
+other node mode already enforces. The restricted wallet endpoint on
+`$DEVICE_IP:18081` is unchanged, so forwarded ports keep working. The mode-7
+branches of `moneroStatus.sh`, `printPl.sh`, `BanListCompare.sh`, `p2pool.sh`
+and `p2poolMining.sh` now talk to `127.0.0.1:$MONERO_PUBLIC_PORT` with the
+login, and the web console's copy of the start command matches. Verified with
+a real monerod on the new flags: 18089 listens on loopback only, `get_bans`
+without credentials returns 401, the status scripts populate their files, and
+the Grafana exporter on the restricted endpoint is unaffected. Note the default
+RPC password shipped in `variables/RPCp.sh` is `password`; the loopback bind is
+the control that matters, the login is defence in depth.
+
 ---
 
 ## Summary of changes in this fork
@@ -259,6 +296,7 @@ operator.
 | 7 | Reflected XSS in responses | Medium | Fixed (output escaping) |
 | 8 | Recursive `chmod 777` | High | Fixed (`harden-permissions.sh`) |
 | 9 | Logs exposed over HTTP | Low | Fixed (logs behind auth) |
+| 10 | Unrestricted RPC on all interfaces (Public Free) | High | Fixed (loopback bind + RPC login) |
 
 New shared helper: `HTML/pinode_security.php` (validation, safe shell-variable
 writing, output escaping). All existing endpoint behavior and file formats are
