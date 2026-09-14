@@ -269,17 +269,20 @@ unrestricted API. If the operator forwarded 18089 as well, that is the
 internet.
 
 **Remediation (this fork):** the unrestricted endpoint is now bound to
-`127.0.0.1` and started with `--rpc-login=$RPCu:$RPCp`, the same login every
-other node mode already enforces. The restricted wallet endpoint on
-`$DEVICE_IP:18081` is unchanged, so forwarded ports keep working. The mode-7
-branches of `moneroStatus.sh`, `printPl.sh`, `BanListCompare.sh`, `p2pool.sh`
-and `p2poolMining.sh` now talk to `127.0.0.1:$MONERO_PUBLIC_PORT` with the
-login, and the web console's copy of the start command matches. Verified with
-a real monerod on the new flags: 18089 listens on loopback only, `get_bans`
-without credentials returns 401, the status scripts populate their files, and
-the Grafana exporter on the restricted endpoint is unaffected. Note the default
-RPC password shipped in `variables/RPCp.sh` is `password`; the loopback bind is
-the control that matters, the login is defence in depth.
+`127.0.0.1`. The restricted wallet endpoint on `$DEVICE_IP:18081` is unchanged,
+so forwarded ports keep working. No `--rpc-login` is added: monerod applies
+that option to the restricted endpoint as well, so it would lock wallets out of
+18081 (a first cut did exactly that and was corrected). The mode-7 branches of
+`moneroStatus.sh`, `printPl.sh`, `BanListCompare.sh`, `blockExplorer.sh`,
+`p2pool.sh` and `p2poolMining.sh` now talk to `127.0.0.1:$MONERO_PUBLIC_PORT`,
+and the web console's copy of the start command matches. Verified with the real
+`moneroPublicFree.service` on the new script: 18089 listens on loopback only
+and refuses connections from the network, `get_bans` answers on loopback,
+`get_info` on 18081 from another host returns 200 without credentials with
+`restricted: true`, the status scripts populate their files, and the Grafana
+exporter on the restricted endpoint is unaffected. Local processes can still
+reach the unrestricted API, as before; the console can already start and stop
+the node, so that adds no capability.
 
 ---
 
@@ -296,7 +299,7 @@ the control that matters, the login is defence in depth.
 | 7 | Reflected XSS in responses | Medium | Fixed (output escaping) |
 | 8 | Recursive `chmod 777` | High | Fixed (`harden-permissions.sh`) |
 | 9 | Logs exposed over HTTP | Low | Fixed (logs behind auth) |
-| 10 | Unrestricted RPC on all interfaces (Public Free) | High | Fixed (loopback bind + RPC login) |
+| 10 | Unrestricted RPC on all interfaces (Public Free) | High | Fixed (loopback bind) |
 
 New shared helper: `HTML/pinode_security.php` (validation, safe shell-variable
 writing, output escaping). All existing endpoint behavior and file formats are
