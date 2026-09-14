@@ -24,7 +24,21 @@ bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 head() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 
 CSRF=(-H "X-PiNode-CSRF: 1")
-post() { curl -s -o /tmp/_body -w '%{http_code}' "${CSRF[@]}" -X POST "$BASE/$1" --data-urlencode "value=$2"; }
+
+# The console requires authentication by default. Supply credentials with
+# PINODE_USER / PINODE_PASS, or let the suite read the generated pair that
+# enable-web-auth.sh leaves in /root/pinode-web-credentials.
+CREDS_FILE=/root/pinode-web-credentials
+PINODE_USER="${PINODE_USER:-}"
+PINODE_PASS="${PINODE_PASS:-}"
+if [ -z "$PINODE_PASS" ] && [ -r "$CREDS_FILE" ]; then
+  PINODE_USER="${PINODE_USER:-$(awk '/^username:/{print $2}' "$CREDS_FILE")}"
+  PINODE_PASS="$(awk '/^password:/{print $2}' "$CREDS_FILE")"
+fi
+AUTH=()
+[ -n "$PINODE_PASS" ] && AUTH=(-u "${PINODE_USER:-pinodexmr}:$PINODE_PASS")
+
+post() { curl -s -o /tmp/_body -w '%{http_code}' "${AUTH[@]+"${AUTH[@]}"}" "${CSRF[@]}" -X POST "$BASE/$1" --data-urlencode "value=$2"; }
 
 # accept <endpoint> <value> <file> <var> -- a valid value is stored correctly
 accept() {
@@ -140,33 +154,50 @@ reject save-custom.php $'./monerod\ntouch /tmp/pinode_pwned'        "newline-inj
 
 head "Request-method enforcement (state change requires POST)"
 for ep in mining-address.php monero-rpc-port.php save-custom.php in-peers.php runScript.php; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' "${CSRF[@]}" "$BASE/$ep?value=1")
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]+"${AUTH[@]}"}" "${CSRF[@]}" "$BASE/$ep?value=1")
   [ "$code" = "400" ] && ok "$ep refuses GET" || bad "$ep answered GET with HTTP $code"
 done
 
 head "CSRF protection"
 # A cross-site attacker can submit a form POST, but cannot set a custom header.
 for ep in mining-address.php monero-rpc-port.php save-custom.php runScript.php monerod-prune.php; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/$ep" --data-urlencode 'value=18081' --data-urlencode 'function=reboot')
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]+"${AUTH[@]}"}" -X POST "$BASE/$ep" --data-urlencode 'value=18081' --data-urlencode 'function=reboot')
   [ "$code" = "400" ] && ok "$ep refuses POST without the CSRF header" \
     || bad "$ep accepted a header-less POST (HTTP $code) - forgeable cross-site"
 done
 # A foreign Origin must be refused even if the header is somehow present.
 for ep in mining-address.php runScript.php; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' "${CSRF[@]}" -H "Origin: http://evil.example" \
+  code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]+"${AUTH[@]}"}" "${CSRF[@]}" -H "Origin: http://evil.example" \
     -X POST "$BASE/$ep" --data-urlencode 'value=18081' --data-urlencode 'function=reboot')
   [ "$code" = "400" ] && ok "$ep refuses a foreign Origin" || bad "$ep accepted Origin http://evil.example (HTTP $code)"
 done
 # The console's own Origin must still work.
 HOSTHDR=$(printf '%s' "$BASE" | sed 's#^https\?://##')
-code=$(curl -s -o /dev/null -w '%{http_code}' "${CSRF[@]}" -H "Origin: $BASE" \
+code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]+"${AUTH[@]}"}" "${CSRF[@]}" -H "Origin: $BASE" \
   -X POST "$BASE/monero-rpc-port.php" --data-urlencode 'value=18081')
 [ "$code" = "200" ] && ok "same-origin request with header still succeeds" \
   || bad "same-origin request was refused (HTTP $code) - console would be broken"
 # The service-control endpoint must still work for the console itself.
-code=$(curl -s -o /dev/null -w '%{http_code}' "${CSRF[@]}" -X POST "$BASE/runScript.php" --data-urlencode 'function=nosuchfunction')
+code=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]+"${AUTH[@]}"}" "${CSRF[@]}" -X POST "$BASE/runScript.php" --data-urlencode 'function=nosuchfunction')
 [ "$code" = "400" ] && ok "runScript.php reachable with header (unknown selector -> 400)" \
   || bad "runScript.php with header returned HTTP $code"
+
+head "Authentication boundary"
+if [ -n "$PINODE_PASS" ]; then
+  for u in nodeControl.html mining-address.php runScript.php debug.log; do
+    c=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/$u")
+    { [ "$c" = "401" ] || [ "$c" = "403" ]; } && ok "$u refused without credentials (HTTP $c)" \
+      || bad "$u served unauthenticated (HTTP $c)"
+  done
+  c=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/nodeControl.html")
+  [ "$c" = "200" ] && ok "console reachable with credentials" || bad "console refused valid credentials (HTTP $c)"
+  c=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/debug.log")
+  [ "$c" = "200" ] || [ "$c" = "404" ] && ok "operator can still read debug.log (HTTP $c)" \
+    || bad "operator cannot read debug.log (HTTP $c)"
+else
+  skip_auth=1
+  printf '  \033[33mSKIP\033[0m authentication not enabled on this console\n'
+fi
 
 head "Reflected-XSS escaping"
 code=$(post save-custom.php './monerod --data-dir=/tmp/<script>alert(1)</script>')
@@ -190,6 +221,25 @@ for n in $WEB_WRITTEN; do
   bash -n "$f" 2>/dev/null || { bad "$(basename "$f") is not valid bash"; BADF=1; }
 done
 [ "$BADF" = 0 ] && ok "all console-written fragments are single-quoted and parse as bash"
+
+head "Public Free node: unrestricted RPC stays on this device"
+# Only meaningful on a live node running in Public Free mode (BOOT_STATUS=7).
+# The unrestricted monerod RPC (MONERO_PUBLIC_PORT) must be bound to loopback
+# and require the RPC login; the LAN address only carries the restricted RPC.
+BOOT_STATUS=""; [ -r /home/pinodexmr/bootstatus.sh ] && BOOT_STATUS=$(sed -n 's/^BOOT_STATUS=//p' /home/pinodexmr/bootstatus.sh)
+if [ "$BOOT_STATUS" = "7" ] && command -v ss >/dev/null 2>&1; then
+  PUBPORT=$(sed -n "s/^MONERO_PUBLIC_PORT=['\"]*\([0-9]*\).*/\1/p" "$VARS/monero-port-public-free.sh" 2>/dev/null); PUBPORT="${PUBPORT:-18089}"
+  DEVIP=$(hostname -I | awk '{print $1}')
+  if ss -ltn | awk '{print $4}' | grep -q "^127\.0\.0\.1:$PUBPORT\$"; then ok "unrestricted RPC :$PUBPORT bound to loopback"
+  else bad "unrestricted RPC :$PUBPORT is not bound to loopback: $(ss -ltn | awk -v p=":$PUBPORT\$" '$4 ~ p {print $4}' | tr '\n' ' ')"; fi
+  if ss -ltn | awk '{print $4}' | grep -qE "^(0\.0\.0\.0|\*|$DEVIP):$PUBPORT\$"; then bad "unrestricted RPC :$PUBPORT reachable on a LAN address"
+  else ok "unrestricted RPC :$PUBPORT not on any LAN address"; fi
+  # An unrestricted-only method must be refused without the RPC login even on loopback.
+  c=$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST "http://127.0.0.1:$PUBPORT/json_rpc" -d '{"jsonrpc":"2.0","id":"0","method":"get_bans"}' -H 'Content-Type: application/json')
+  [ "$c" = "401" ] && ok "unrestricted RPC requires the RPC login (HTTP $c)" || bad "get_bans without credentials returned HTTP $c"
+else
+  printf '  \033[33mSKIP\033[0m not a live node in Public Free mode\n'
+fi
 
 head "No payload achieved execution"
 if [ -f /tmp/pinode_pwned ]; then bad "/tmp/pinode_pwned EXISTS - an injection succeeded"
